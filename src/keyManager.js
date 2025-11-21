@@ -7,26 +7,19 @@
  * status for all keys, select an available key respecting rate limits and
  * daily quotas, and refresh authentication tokens.
  *
- * The key data model is stored in Redis using a hash per subscription ID
- * under the pattern `mailtester:key:{subscriptionId}`.  Additional helper
- * fields (e.g. rate limits and counters) live alongside the plan and token.
- *
- * Environment-driven initialisation supports multiple formats:
- *
- *   - MAILTESTER_KEYS_JSON: a JSON array of objects { id, plan }
- *   - MAILTESTER_KEYS_WITH_PLAN: comma-separated list of `id:plan` pairs
- *   - MAILTESTER_KEYS: comma-separated list of IDs with a single default plan
- *   - MAILTESTER_KEYS_JSON_PATH: file path to a JSON file containing the
- *       array described above
- *
- * When multiple formats are provided the precedence order is:
- * JSON (either inline or file) -> CSV mapping -> plain list.
+ * Key metadata is stored in MongoDB (collection: `keys`).  Each document
+ * contains the plan, counters, rate limits and current token for a
+ * subscription ID.  All operations funnel through this module to keep the
+ * data model consistent.
  */
 const axios = require('axios');
-const redis = require('./redisClient');
-const logger = require('./logger');
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
+const mongoClient = require('./mongoClient');
+
+const WINDOW_MS = 30_000;
+const DAY_MS = 86_400_000;
 
 // Internal helper: compute rate limits based on plan
 function getRateLimits(plan) {
@@ -46,7 +39,7 @@ function getRateLimits(plan) {
 
 /**
  * Initialise keys defined in the MAILTESTER_KEYS environment variable.  If
- * subscription IDs are supplied they are inserted into Redis with a default
+ * subscription IDs are supplied they are inserted into MongoDB with a default
  * plan of "ultimate".  Existing keys are left untouched.  This helper is
  * typically called once on server startup.
  */
@@ -150,25 +143,22 @@ async function initializeKeysFromEnv() {
   }
 }
 
-/**
- * Register or update a key in Redis.  When registering a new key the
- * appropriate rate limits are computed from the plan.  Updating an existing
- * key will adjust its plan and limits without resetting usage counters.
- *
- * @param {string} subscriptionId The MailTester subscription ID
- * @param {string} plan Either "pro" or "ultimate"
- */
+async function getKeysCollection() {
+  await mongoClient.connectMongo();
+  return mongoClient.getKeysCollection();
+}
+
 async function registerKey(subscriptionId, plan) {
   if (!subscriptionId) {
     throw new Error('subscriptionId is required');
   }
   const limits = getRateLimits(plan);
-  const key = `mailtester:key:${subscriptionId}`;
   const now = Date.now();
-  const exists = await redis.client.exists(key);
-  if (!exists) {
-    // brand new key
-    const data = {
+  const collection = await getKeysCollection();
+  const existing = await collection.findOne({ subscriptionId });
+  if (!existing) {
+    const doc = {
+      subscriptionId,
       plan: plan.toLowerCase(),
       token: '',
       lastRefresh: now,
@@ -182,18 +172,16 @@ async function registerKey(subscriptionId, plan) {
       avgRequestIntervalMs: limits.avgRequestIntervalMs,
       lastUsed: 0
     };
-    await redis.client.hSet(key, data);
-    await redis.client.sAdd('mailtester:keys', subscriptionId);
-    logger.info({ msg: 'Registered new key', subscriptionId, plan: data.plan });
+    await collection.insertOne(doc);
+    logger.info({ msg: 'Registered new key', subscriptionId, plan: doc.plan });
   } else {
-    // update plan and limits but keep counters
     const updates = {
       plan: plan.toLowerCase(),
       rateLimit30s: limits.rateLimit30s,
       dailyLimit: limits.dailyLimit,
       avgRequestIntervalMs: limits.avgRequestIntervalMs
     };
-    await redis.client.hSet(key, updates);
+    await collection.updateOne({ subscriptionId }, { $set: updates });
     logger.info({ msg: 'Updated existing key', subscriptionId, plan: updates.plan });
   }
 }
@@ -204,150 +192,109 @@ async function registerKey(subscriptionId, plan) {
  * @param {string} subscriptionId 
  */
 async function deleteKey(subscriptionId) {
-  const key = `mailtester:key:${subscriptionId}`;
-  await redis.client.del(key);
-  await redis.client.sRem('mailtester:keys', subscriptionId);
+  const collection = await getKeysCollection();
+  await collection.deleteOne({ subscriptionId });
   logger.info({ msg: 'Deleted key', subscriptionId });
 }
 
 /**
  * Retrieve status objects for all known keys.
  *
- * Each object includes the subscriptionId and the contents of the Redis hash.
+ * Each object includes the subscriptionId and the stored metadata.
  */
 async function getAllKeysStatus() {
-  const ids = await redis.client.sMembers('mailtester:keys');
-  const result = [];
-  for (const id of ids) {
-    const data = await redis.client.hGetAll(`mailtester:key:${id}`);
-    if (!data || Object.keys(data).length === 0) {
-      continue;
-    }
-    const parsed = {};
-    for (const [field, value] of Object.entries(data)) {
-      // Convert numeric fields to numbers when possible
-      if (['usedInWindow', 'windowStart', 'usedDaily', 'dayStart', 'rateLimit30s', 'dailyLimit', 'avgRequestIntervalMs', 'lastRefresh', 'lastUsed'].includes(field)) {
-        parsed[field] = Number(value);
-      } else {
-        parsed[field] = value;
-      }
-    }
-    result.push({ subscriptionId: id, ...parsed });
-  }
-  return result;
+  const collection = await getKeysCollection();
+  const docs = await collection.find().toArray();
+  return docs.map(({ _id, ...rest }) => rest);
 }
 
 /**
  * Determine the next available key.  Keys that are banned or exhausted or
  * outside their 30-second window are ignored.  The candidate with the lowest
  * `usedInWindow` counter is selected.  The selected key's counters are
- * incremented atomically using Redis transactions to mitigate race conditions.
+ * incremented atomically using MongoDB compare-and-set semantics to mitigate race conditions.
  *
  * @returns {Promise<null|{subscriptionId: string, token: string, plan: string}>}
  */
 async function getAvailableKey() {
-  const ids = await redis.client.sMembers('mailtester:keys');
-  const candidates = [];
-  for (const id of ids) {
-    const key = `mailtester:key:${id}`;
-    const data = await redis.client.hGetAll(key);
-    if (!data || Object.keys(data).length === 0) {
-      continue;
-    }
-    const status = data.status;
-    if (status !== 'active') {
-      continue;
-    }
-    const usedInWindow = Number(data.usedInWindow || '0');
-    const windowStart = Number(data.windowStart || '0');
-    const usedDaily = Number(data.usedDaily || '0');
-    const dayStart = Number(data.dayStart || '0');
-    const rateLimit30s = Number(data.rateLimit30s || '0');
-    const dailyLimit = Number(data.dailyLimit || '0');
-    const now = Date.now();
-    // skip if this key's window hasn't reset and it's full
-    if (now - windowStart < 30000 && usedInWindow >= rateLimit30s) {
-      continue;
-    }
-    // skip if this key has hit its daily limit
-    if (now - dayStart < 86400000 && usedDaily >= dailyLimit) {
-      // mark exhausted so future queries skip faster
-      await redis.client.hSet(key, 'status', 'exhausted');
-      continue;
-    }
-    candidates.push({ id, usedInWindow, data });
-  }
-  if (candidates.length === 0) {
+  const collection = await getKeysCollection();
+  const docs = await collection.find().toArray();
+  if (!docs.length) {
     return null;
   }
-  // pick candidate with lowest usedInWindow
-  candidates.sort((a, b) => a.usedInWindow - b.usedInWindow);
-  const chosen = candidates[0];
-  const keyName = `mailtester:key:${chosen.id}`;
-  const maxAttempts = 5;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    // Watch the hash for changes
-    try {
-      await redis.client.watch(keyName);
-      const current = await redis.client.hGetAll(keyName);
-      if (!current || Object.keys(current).length === 0) {
-        await redis.client.unwatch();
-        return null;
+  const now = Date.now();
+  const candidates = [];
+  for (const doc of docs) {
+    if (doc.status !== 'active') {
+      continue;
+    }
+    const windowExpired = now - doc.windowStart >= WINDOW_MS;
+    const dayExpired = now - doc.dayStart >= DAY_MS;
+    const windowCount = windowExpired ? 0 : doc.usedInWindow || 0;
+    const dayCount = dayExpired ? 0 : doc.usedDaily || 0;
+
+    if (!dayExpired && dayCount >= doc.dailyLimit) {
+      await collection.updateOne({ subscriptionId: doc.subscriptionId }, { $set: { status: 'exhausted' } });
+      continue;
+    }
+    if (!windowExpired && windowCount >= doc.rateLimit30s) {
+      continue;
+    }
+
+    candidates.push({
+      doc,
+      windowExpired,
+      dayExpired,
+      windowCount,
+      dayCount
+    });
+  }
+
+  if (!candidates.length) {
+    return null;
+  }
+
+  candidates.sort((a, b) => a.windowCount - b.windowCount);
+
+  for (const candidate of candidates) {
+    const { doc } = candidate;
+    const attemptTime = Date.now();
+    const nextWindowStart = candidate.windowExpired ? attemptTime : doc.windowStart;
+    const nextDayStart = candidate.dayExpired ? attemptTime : doc.dayStart;
+    const newWindowCount = (candidate.windowExpired ? 0 : candidate.windowCount) + 1;
+    const newDayCount = (candidate.dayExpired ? 0 : candidate.dayCount) + 1;
+    const willExhaust = !candidate.dayExpired && newDayCount >= doc.dailyLimit;
+
+    const filter = {
+      subscriptionId: doc.subscriptionId,
+      usedInWindow: doc.usedInWindow,
+      windowStart: doc.windowStart,
+      usedDaily: doc.usedDaily,
+      dayStart: doc.dayStart,
+      status: doc.status
+    };
+
+    const update = {
+      $set: {
+        usedInWindow: newWindowCount,
+        windowStart: nextWindowStart,
+        usedDaily: newDayCount,
+        dayStart: nextDayStart,
+        lastUsed: attemptTime,
+        status: willExhaust ? 'exhausted' : 'active'
       }
-      const now = Date.now();
-      const usedInWindow = Number(current.usedInWindow || '0');
-      const windowStart = Number(current.windowStart || '0');
-      const usedDaily = Number(current.usedDaily || '0');
-      const dayStart = Number(current.dayStart || '0');
-      const rateLimit30s = Number(current.rateLimit30s || '0');
-      const dailyLimit = Number(current.dailyLimit || '0');
-      const status = current.status;
-      // ensure still eligible
-      if (status !== 'active') {
-        await redis.client.unwatch();
-        return null;
-      }
-      if (now - windowStart < 30000 && usedInWindow >= rateLimit30s) {
-        await redis.client.unwatch();
-        return null;
-      }
-      if (now - dayStart < 86400000 && usedDaily >= dailyLimit) {
-        await redis.client.hSet(keyName, 'status', 'exhausted');
-        await redis.client.unwatch();
-        return null;
-      }
-      const multi = redis.client.multi();
-      // reset window if expired
-      if (now - windowStart >= 30000) {
-        multi.hSet(keyName, { usedInWindow: 0, windowStart: now });
-      }
-      // reset daily if expired
-      if (now - dayStart >= 86400000) {
-        multi.hSet(keyName, { usedDaily: 0, dayStart: now, status: 'active' });
-      }
-      multi.hIncrBy(keyName, 'usedInWindow', 1);
-      multi.hIncrBy(keyName, 'usedDaily', 1);
-      multi.hSet(keyName, 'lastUsed', now);
-      const results = await multi.exec();
-      if (results === null) {
-        // someone changed it; retry
-        continue;
-      }
-      const newUsedDaily = usedDaily + 1;
-      if (now - dayStart < 86400000 && newUsedDaily >= dailyLimit) {
-        await redis.client.hSet(keyName, 'status', 'exhausted');
-      }
+    };
+
+    const result = await collection.findOneAndUpdate(filter, update, { returnDocument: 'after' });
+    if (result.value) {
       return {
-        subscriptionId: chosen.id,
-        token: current.token,
-        plan: current.plan
+        subscriptionId: result.value.subscriptionId,
+        token: result.value.token,
+        plan: result.value.plan
       };
-    } catch (err) {
-      logger.error({ msg: 'Error selecting key', error: err.message });
-      await redis.client.unwatch();
-      return null;
     }
   }
+
   return null;
 }
 
@@ -359,22 +306,24 @@ async function getAvailableKey() {
  * @param {string} subscriptionId
  */
 async function refreshToken(subscriptionId) {
-  const keyName = `mailtester:key:${subscriptionId}`;
+  const collection = await getKeysCollection();
   try {
     const url = `https://token.mailtester.ninja/token?key=${encodeURIComponent(subscriptionId)}`;
     const response = await axios.get(url, { timeout: 10000 });
     if (response.status === 200 && response.data && response.data.token) {
       const token = String(response.data.token);
-      await redis.client.hSet(keyName, { token, lastRefresh: Date.now() });
+      await collection.updateOne(
+        { subscriptionId },
+        { $set: { token, lastRefresh: Date.now(), status: 'active' } }
+      );
       logger.info({ msg: 'Refreshed token', subscriptionId });
       return token;
     }
     logger.warn({ msg: 'Unexpected token refresh response', subscriptionId, status: response.status });
     return null;
   } catch (err) {
-    // If the service returns 401/403 the key is invalid or banned
     if (err.response && (err.response.status === 401 || err.response.status === 403)) {
-      await redis.client.hSet(keyName, 'status', 'banned');
+      await collection.updateOne({ subscriptionId }, { $set: { status: 'banned' } });
       logger.warn({ msg: 'Key banned during token refresh', subscriptionId, status: err.response.status });
     } else {
       logger.error({ msg: 'Token refresh error', subscriptionId, error: err.message });
@@ -392,17 +341,15 @@ async function refreshToken(subscriptionId) {
 async function refreshTokensForAll() {
   const refreshHours = parseInt(process.env.REFRESH_INTERVAL_HOURS || '24', 10);
   const intervalMs = refreshHours * 60 * 60 * 1000;
-  const ids = await redis.client.sMembers('mailtester:keys');
   const now = Date.now();
-  for (const id of ids) {
-    const keyName = `mailtester:key:${id}`;
-    const lastRefresh = Number(await redis.client.hGet(keyName, 'lastRefresh') || '0');
-    const status = await redis.client.hGet(keyName, 'status');
-    if (status === 'banned') {
+  const collection = await getKeysCollection();
+  const docs = await collection.find().toArray();
+  for (const doc of docs) {
+    if (doc.status === 'banned') {
       continue;
     }
-    if (now - lastRefresh >= intervalMs) {
-      await refreshToken(id);
+    if (now - (doc.lastRefresh || 0) >= intervalMs) {
+      await refreshToken(doc.subscriptionId);
     }
   }
 }
@@ -412,13 +359,15 @@ async function refreshTokensForAll() {
  * elapsed.  This helper is idempotent and safe to call at a fixed interval.
  */
 async function resetWindowsForAll() {
-  const ids = await redis.client.sMembers('mailtester:keys');
+  const collection = await getKeysCollection();
   const now = Date.now();
-  for (const id of ids) {
-    const keyName = `mailtester:key:${id}`;
-    const windowStart = Number(await redis.client.hGet(keyName, 'windowStart') || '0');
-    if (now - windowStart >= 30000) {
-      await redis.client.hSet(keyName, { usedInWindow: 0, windowStart: now });
+  const docs = await collection.find().toArray();
+  for (const doc of docs) {
+    if (now - doc.windowStart >= WINDOW_MS) {
+      await collection.updateOne(
+        { subscriptionId: doc.subscriptionId },
+        { $set: { usedInWindow: 0, windowStart: now } }
+      );
     }
   }
 }
@@ -429,19 +378,16 @@ async function resetWindowsForAll() {
  * exhausted.  Banned keys remain banned.
  */
 async function resetDailyForAll() {
-  const ids = await redis.client.sMembers('mailtester:keys');
+  const collection = await getKeysCollection();
   const now = Date.now();
-  for (const id of ids) {
-    const keyName = `mailtester:key:${id}`;
-    const dayStart = Number(await redis.client.hGet(keyName, 'dayStart') || '0');
-    const status = await redis.client.hGet(keyName, 'status');
-    if (now - dayStart >= 86400000) {
+  const docs = await collection.find().toArray();
+  for (const doc of docs) {
+    if (now - doc.dayStart >= DAY_MS) {
       const updates = { usedDaily: 0, dayStart: now };
-      // reactivate exhausted keys
-      if (status === 'exhausted') {
+      if (doc.status === 'exhausted') {
         updates.status = 'active';
       }
-      await redis.client.hSet(keyName, updates);
+      await collection.updateOne({ subscriptionId: doc.subscriptionId }, { $set: updates });
     }
   }
 }

@@ -4,7 +4,7 @@
  * Single entrypoint for the microservice.
  * - Loads .env from the current project directory
  * - Boots Express routes and healthcheck
- * - Connects to Redis, preloads keys, starts cron
+ * - Connects to MongoDB, preloads keys, starts cron
  * - Handles graceful shutdown
  */
 
@@ -15,9 +15,11 @@ require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 
 const express = require('express');
 const logger = require('./src/logger');
-const redisClient = require('./src/redisClient');
+const mongoClient = require('./src/mongoClient');
 const keyManager = require('./src/keyManager');
 const scheduler = require('./src/scheduler');
+const envWatcher = require('./src/envWatcher');
+const keyHealthChecker = require('./src/keyHealthChecker');
 const keysRoutes = require('./routes/keys');
 
 const app = express();
@@ -30,12 +32,20 @@ app.use(keysRoutes);
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
 async function start() {
+  let stopEnvWatcher = async () => {};
+  let stopHealthChecker = async () => {};
   try {
-    // Connect to Redis
-    await redisClient.connectRedis();
+    // Connect to MongoDB
+    await mongoClient.connectMongo();
 
     // Preload keys from env / JSON file
     await keyManager.initializeKeysFromEnv();
+
+    // Start watching the .env file to keep keys in sync
+    stopEnvWatcher = await envWatcher.startWatching(path.resolve(__dirname, '.env'));
+
+    // Start the 24-hour key health checker
+    stopHealthChecker = keyHealthChecker.startScheduler(path.resolve(__dirname, '.env'));
 
     // Start cron jobs
     scheduler.startSchedulers();
@@ -50,9 +60,19 @@ async function start() {
       logger.info({ msg: 'Shutting down server...' });
       server.close(async () => {
         try {
-          await redisClient.client.quit();
+          await mongoClient.disconnectMongo();
         } catch (err) {
-          logger.error({ msg: 'Error during Redis quit', error: err.message });
+          logger.error({ msg: 'Error during Mongo disconnect', error: err.message });
+        }
+        try {
+          await stopEnvWatcher();
+        } catch (err) {
+          logger.error({ msg: 'Error stopping env watcher', error: err.message });
+        }
+        try {
+          await stopHealthChecker();
+        } catch (err) {
+          logger.error({ msg: 'Error stopping key health checker', error: err.message });
         }
         process.exit(0);
       });

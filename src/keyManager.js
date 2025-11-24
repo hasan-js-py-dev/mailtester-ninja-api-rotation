@@ -180,7 +180,13 @@ async function registerKey(subscriptionId, plan) {
       rateLimit30s: limits.rateLimit30s,
       dailyLimit: limits.dailyLimit,
       avgRequestIntervalMs: limits.avgRequestIntervalMs,
-      lastUsed: 0
+      lastUsed: 0,
+      validationStats: {
+        total: 0,
+        byCode: {},
+        lastResult: null,
+        lastUpdated: 0
+      }
     };
     await collection.insertOne(doc);
     logger.info({ msg: 'Registered new key', subscriptionId, plan: doc.plan });
@@ -231,79 +237,88 @@ async function getAllKeysStatus() {
  */
 async function getAvailableKey() {
   const collection = await getKeysCollection();
-  const docs = await collection.find().toArray();
-  if (!docs.length) {
-    return null;
-  }
-  const now = Date.now();
-  const candidates = [];
-  for (const doc of docs) {
-    if (doc.status !== 'active') {
-      continue;
-    }
-    const windowExpired = now - doc.windowStart >= WINDOW_MS;
-    const dayExpired = now - doc.dayStart >= DAY_MS;
-    const windowCount = windowExpired ? 0 : doc.usedInWindow || 0;
-    const dayCount = dayExpired ? 0 : doc.usedDaily || 0;
-
-    if (!dayExpired && dayCount >= doc.dailyLimit) {
-      await collection.updateOne({ subscriptionId: doc.subscriptionId }, { $set: { status: 'exhausted' } });
-      continue;
-    }
-    if (!windowExpired && windowCount >= doc.rateLimit30s) {
-      continue;
+  const maxAttempts = 3;
+  for (let attemptIndex = 0; attemptIndex < maxAttempts; attemptIndex += 1) {
+    const docs = await collection.find().toArray();
+    if (!docs.length) {
+      return null;
     }
 
-    candidates.push({
-      doc,
-      windowExpired,
-      dayExpired,
-      windowCount,
-      dayCount
-    });
-  }
-
-  if (!candidates.length) {
-    return null;
-  }
-
-  candidates.sort((a, b) => a.windowCount - b.windowCount);
-
-  for (const candidate of candidates) {
-    const { doc } = candidate;
-    const attemptTime = Date.now();
-    const nextWindowStart = candidate.windowExpired ? attemptTime : doc.windowStart;
-    const nextDayStart = candidate.dayExpired ? attemptTime : doc.dayStart;
-    const newWindowCount = (candidate.windowExpired ? 0 : candidate.windowCount) + 1;
-    const newDayCount = (candidate.dayExpired ? 0 : candidate.dayCount) + 1;
-    const willExhaust = !candidate.dayExpired && newDayCount >= doc.dailyLimit;
-
-    const filter = {
-      subscriptionId: doc.subscriptionId,
-      usedInWindow: doc.usedInWindow,
-      windowStart: doc.windowStart,
-      usedDaily: doc.usedDaily,
-      dayStart: doc.dayStart,
-      status: doc.status
-    };
-
-    const update = {
-      $set: {
-        usedInWindow: newWindowCount,
-        windowStart: nextWindowStart,
-        usedDaily: newDayCount,
-        dayStart: nextDayStart,
-        lastUsed: attemptTime,
-        status: willExhaust ? 'exhausted' : 'active'
+    const now = Date.now();
+    const candidates = [];
+    for (const doc of docs) {
+      if (doc.status !== 'active') {
+        continue;
       }
-    };
+      const windowExpired = now - doc.windowStart >= WINDOW_MS;
+      const dayExpired = now - doc.dayStart >= DAY_MS;
+      const windowCount = windowExpired ? 0 : doc.usedInWindow || 0;
+      const dayCount = dayExpired ? 0 : doc.usedDaily || 0;
 
-    const result = await collection.findOneAndUpdate(filter, update, { returnDocument: 'after' });
-    if (result.value) {
-      return {
-        subscriptionId: result.value.subscriptionId,
-        plan: result.value.plan
+      if (!dayExpired && dayCount >= doc.dailyLimit) {
+        await collection.updateOne({ subscriptionId: doc.subscriptionId }, { $set: { status: 'exhausted' } });
+        continue;
+      }
+      if (!windowExpired && windowCount >= doc.rateLimit30s) {
+        continue;
+      }
+
+      candidates.push({
+        doc,
+        windowExpired,
+        dayExpired,
+        windowCount,
+        dayCount
+      });
+    }
+
+    if (!candidates.length) {
+      return null;
+    }
+
+    candidates.sort((a, b) => a.windowCount - b.windowCount);
+
+    for (const candidate of candidates) {
+      const { doc } = candidate;
+      const attemptTime = Date.now();
+      const nextWindowStart = candidate.windowExpired ? attemptTime : doc.windowStart;
+      const nextDayStart = candidate.dayExpired ? attemptTime : doc.dayStart;
+      const newWindowCount = (candidate.windowExpired ? 0 : candidate.windowCount) + 1;
+      const newDayCount = (candidate.dayExpired ? 0 : candidate.dayCount) + 1;
+      const willExhaust = !candidate.dayExpired && newDayCount >= doc.dailyLimit;
+
+      const filter = {
+        subscriptionId: doc.subscriptionId,
+        usedInWindow: doc.usedInWindow,
+        windowStart: doc.windowStart,
+        usedDaily: doc.usedDaily,
+        dayStart: doc.dayStart,
+        status: doc.status
       };
+
+      const update = {
+        $set: {
+          usedInWindow: newWindowCount,
+          windowStart: nextWindowStart,
+          usedDaily: newDayCount,
+          dayStart: nextDayStart,
+          lastUsed: attemptTime,
+          status: willExhaust ? 'exhausted' : 'active'
+        }
+      };
+
+      const result = await collection.findOneAndUpdate(filter, update, { returnDocument: 'after' });
+      const updatedDoc = result && Object.prototype.hasOwnProperty.call(result, 'value') ? result.value : result;
+      if (updatedDoc) {
+        return {
+          subscriptionId: updatedDoc.subscriptionId,
+          plan: updatedDoc.plan
+        };
+      }
+    }
+
+    if (attemptIndex < maxAttempts - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
     }
   }
 
@@ -349,6 +364,93 @@ async function resetDailyForAll() {
   }
 }
 
+function normalizeValidationCode(rawCode) {
+  const code = String(rawCode || 'unknown').trim().toLowerCase();
+  return code.replace(/[^a-z0-9_-]/g, '_') || 'unknown';
+}
+
+function buildLastResult({ email, code, message, durationMs, metadata }) {
+  const result = {
+    email: email || null,
+    code: code || null,
+    message: message || null,
+    timestamp: Date.now()
+  };
+  if (Number.isFinite(durationMs)) {
+    result.durationMs = Number(durationMs);
+  }
+  if (metadata && typeof metadata === 'object') {
+    result.metadata = metadata;
+  }
+  return result;
+}
+
+async function recordValidationResult({ subscriptionId, email, code, message, durationMs, metadata }) {
+  if (!subscriptionId) {
+    throw new Error('subscriptionId is required to record a result');
+  }
+  const collection = await getKeysCollection();
+  const safeCode = normalizeValidationCode(code);
+  const incPaths = {
+    'validationStats.total': 1,
+    [`validationStats.byCode.${safeCode}`]: 1
+  };
+  const lastResult = buildLastResult({ email, code, message, durationMs, metadata });
+  const update = {
+    $inc: incPaths,
+    $set: {
+      'validationStats.lastResult': lastResult,
+      'validationStats.lastUpdated': lastResult.timestamp
+    }
+  };
+  if (email) {
+    update.$set['validationStats.lastEmail'] = email;
+  }
+  if (code) {
+    update.$set['validationStats.lastCode'] = code;
+  }
+
+  const result = await collection.updateOne({ subscriptionId }, update);
+  if (!result.matchedCount) {
+    return false;
+  }
+  return true;
+}
+
+async function getValidationStatsSummary() {
+  const collection = await getKeysCollection();
+  const docs = await collection
+    .find()
+    .project({ _id: 0, subscriptionId: 1, plan: 1, validationStats: 1 })
+    .toArray();
+
+  const summary = { total: 0, byCode: {} };
+  const keys = [];
+
+  const bumpSummary = (byCode = {}) => {
+    for (const [code, count] of Object.entries(byCode)) {
+      summary.byCode[code] = (summary.byCode[code] || 0) + count;
+    }
+  };
+
+  for (const doc of docs) {
+    const stats = doc.validationStats || {};
+    const entry = {
+      subscriptionId: doc.subscriptionId,
+      plan: doc.plan,
+      total: stats.total || 0,
+      byCode: stats.byCode || {},
+      lastResult: stats.lastResult || null,
+      lastUpdated: stats.lastUpdated || null
+    };
+    keys.push(entry);
+    summary.total += entry.total;
+    bumpSummary(entry.byCode);
+  }
+
+  return { summary, keys };
+}
+
 module.exports = {
   initializeKeysFromEnv,
   registerKey,
@@ -356,5 +458,7 @@ module.exports = {
   getAllKeysStatus,
   getAvailableKey,
   resetWindowsForAll,
-  resetDailyForAll
+  resetDailyForAll,
+  recordValidationResult,
+  getValidationStatsSummary
 };

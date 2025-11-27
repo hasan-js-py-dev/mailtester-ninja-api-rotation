@@ -155,6 +155,42 @@ run().catch(console.error);
 
 The microservice enforces limits and balances across all configured subscriptions so downstream code can focus on MailTester requests.
 
+## Docker & GitHub Actions deployment
+
+This repository includes a production-ready container image (`Dockerfile`) and an automated deploy pipeline (`.github/workflows/deploy.yml`). Deployments run on every push to `main` (and on manual triggers via **Run workflow**) and perform the following steps:
+
+- Build the Node.js service image with `docker buildx`.
+- Push the image to GitHub Container Registry (GHCR) under `ghcr.io/<owner>/<repo>` with both `latest` and commit SHA tags.
+- Copy `deploy/docker-compose.yml` to your VPS and run `docker compose pull && docker compose up -d` to refresh the running container.
+
+### 1. Prepare the VPS
+
+- Install Docker Engine and the Compose plugin (`sudo apt install docker.io docker-compose-plugin`).
+- Create directories for configuration:
+   - `/etc/mailtester/.env` — copy your production `.env` here.
+   - `/var/lib/mailtester/keys.json` — copy the production keys JSON file here; it will be mounted read-only.
+   - `/opt/mailtester` — deployment root used by the workflow.
+- Ensure the deploy user (set in `VPS_USER`) can run Docker (add to the `docker` group or configure `sudo` without password).
+
+### 2. Configure GitHub Secrets
+
+Add the following repository secrets before enabling the workflow:
+
+- `VPS_HOST` — server IP or hostname (e.g. `158.220.114.211`).
+- `VPS_USER` — SSH user with access to Docker.
+- `VPS_SSH_KEY` — **private** SSH key authorised on the VPS (use `ssh-keygen -t ed25519`). Store the entire PEM string.
+- `GHCR_PAT` — personal access token with at least `read:packages` scope (so the VPS can `docker login ghcr.io`).
+- Optional: `VPS_PORT` if SSH runs on a non-default port (the workflow defaults to `22`).
+
+### 3. First-time deployment
+
+1. Commit + push the Docker setup or run **Actions → Build and Deploy → Run workflow**.
+2. The workflow creates `/opt/mailtester/docker-compose.yml` on the VPS. Review/edit if you need different host paths/ports.
+3. Ensure `/etc/mailtester/.env` and `/var/lib/mailtester/keys.json` exist *before* the first pipeline run; the container fails to boot if `.env` is missing.
+4. Verify the service with `docker compose ps` and `curl http://<host>:8000/health` (port 8000 is mapped to the container's internal port 3000).
+
+On subsequent pushes to `main`, GitHub Actions will build a new image, push to GHCR, and redeploy automatically. To roll back, run `docker compose up -d` on the VPS with a previous tag (e.g. `ghcr.io/<owner>/<repo>:<old-sha>`).
+
 ## License
 
 MIT

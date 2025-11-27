@@ -1,0 +1,14 @@
+version: "3.9"
+
+services:
+  mailtester:
+    image: ghcr.io/hasan-js-py-dev/mailtester-ninja-api-rotation:latest
+    container_name: mailtester-service
+    restart: unless-stopped
+    volumes:
+      - /etc/mailtester/.env:/usr/src/app/.env:ro
+      - /var/lib/mailtester/keys.json:/usr/src/app/keys.json:ro
+    ports:
+      - "8000:3000"
+    environment:
+      - NODE_ENV=production

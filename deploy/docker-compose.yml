@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     volumes:
       - /etc/mailtester/.env:/usr/src/app/.env:ro
-      - /var/lib/mailtester/keys.json:/usr/src/app/keys.json:ro
+      - ./keys.json:/usr/src/app/deploy/keys.json:ro
     ports:
       - "8000:3000"
     environment:

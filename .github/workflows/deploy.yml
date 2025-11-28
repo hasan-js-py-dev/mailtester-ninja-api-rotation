@@ -8,7 +8,7 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/${{ github.repository }}
-  DEPLOY_PATH: /opt/mailtester
+  DEPLOY_PATH: /root/mailtester
 
 jobs:
   build-and-deploy:

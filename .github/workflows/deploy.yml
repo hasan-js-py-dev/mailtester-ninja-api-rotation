@@ -9,6 +9,7 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ghcr.io/${{ github.repository }}
   DEPLOY_PATH: /root/mailtester
+  GHCR_USERNAME: ${{ secrets.GHCR_USERNAME || github.repository_owner }}
 
 jobs:
   build-and-deploy:
@@ -104,7 +105,11 @@ jobs:
           script: |
             set -e
             cd ${{ env.DEPLOY_PATH }}
-            echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u ${{ github.repository_owner }} --password-stdin
+            if [ -z "${{ secrets.GHCR_PAT }}" ]; then
+              echo "GHCR_PAT secret is missing or empty. Create a GitHub PAT with at least read:packages (and repo if the image/package is private), then add it as the GHCR_PAT repository secret.";
+              exit 1;
+            fi
+            echo "${{ secrets.GHCR_PAT }}" | docker login ${{ env.REGISTRY }} -u "${{ env.GHCR_USERNAME }}" --password-stdin
             docker compose pull mailtester
             docker compose up -d mailtester
             docker image prune -f

@@ -63,12 +63,17 @@ jobs:
 
       - name: Upload environment file to VPS
         uses: appleboy/scp-action@v0.1.7
+        if: ${{ hashFiles('.env') != '' }}
         with:
           host: ${{ secrets.VPS_HOST }}
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           source: ".env"
           target: "${{ env.DEPLOY_PATH }}/"
+
+      - name: Skip uploading .env (not present in repo)
+        if: ${{ hashFiles('.env') == '' }}
+        run: echo "No .env file committed in repo; skipping upload. Ensure ${DEPLOY_PATH}/.env exists on the VPS."
 
       - name: Upload docker-compose.yml to VPS
         uses: appleboy/scp-action@v0.1.7

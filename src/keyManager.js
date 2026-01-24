@@ -266,6 +266,57 @@ async function getKeyLimits() {
 }
 
 /**
+ * Return all keys that are currently available based on rate limits and
+ * spacing. This does not mutate counters.
+ */
+async function getAvailableKeysSnapshot() {
+  const collection = await getKeysCollection();
+  const docs = await collection.find().toArray();
+  if (!docs.length) {
+    return [];
+  }
+
+  const now = Date.now();
+  const candidates = [];
+
+  for (const doc of docs) {
+    if (doc.status !== 'active') {
+      continue;
+    }
+    const windowExpired = now - doc.windowStart >= WINDOW_MS;
+    const dayExpired = now - doc.dayStart >= DAY_MS;
+    const windowCount = windowExpired ? 0 : doc.usedInWindow || 0;
+    const dayCount = dayExpired ? 0 : doc.usedDaily || 0;
+    const avgInterval = Number(doc.avgRequestIntervalMs) || Math.floor(WINDOW_MS / Math.max(doc.rateLimit30s || 1, 1));
+    const lastUsed = typeof doc.lastUsed === 'number' ? doc.lastUsed : 0;
+    const spacingExpired = avgInterval <= 0 || now - lastUsed >= avgInterval;
+
+    if (!dayExpired && dayCount >= doc.dailyLimit) {
+      continue;
+    }
+    if (!windowExpired && windowCount >= doc.rateLimit30s) {
+      continue;
+    }
+    if (!spacingExpired) {
+      continue;
+    }
+
+    candidates.push({
+      subscriptionId: doc.subscriptionId,
+      plan: doc.plan,
+      avgRequestIntervalMs: avgInterval,
+      lastUsed,
+      nextRequestAllowedAt: lastUsed + avgInterval,
+      usedInWindow: windowCount,
+      usedDaily: dayCount
+    });
+  }
+
+  candidates.sort((a, b) => a.usedInWindow - b.usedInWindow);
+  return candidates.map(({ usedInWindow, usedDaily, ...rest }) => rest);
+}
+
+/**
  * Determine the next available key.  Keys that are banned or exhausted or
  * outside their 30-second window are ignored.  The candidate with the lowest
  * `usedInWindow` counter is selected.  The selected key's counters are
@@ -419,6 +470,7 @@ module.exports = {
   deleteKey,
   getAllKeysStatus,
   getKeyLimits,
+  getAvailableKeysSnapshot,
   getAvailableKey,
   resetWindowsForAll,
   resetDailyForAll

@@ -15,53 +15,27 @@
 const express = require('express');
 const keyManager = require('../src/keyManager');
 const logger = require('../src/logger');
-const { keyQueue, keyQueueEvents } = require('../src/keyQueue');
 
 const router = express.Router();
-const KEY_QUEUE_REQUEST_TIMEOUT_MS = Number(process.env.KEY_QUEUE_REQUEST_TIMEOUT_MS || 0);
-
 /**
  * GET /key/available
  *
- * Returns an available MailTester key within rate limits.  If no key is
- * currently available the client receives an HTTP 429 response with a JSON
- * body instructing it to wait a short while before retrying.
+ * Returns all available MailTester keys within rate limits. If none are
+ * currently available the client receives an empty array with a status note.
  */
 router.get('/key/available', async (req, res) => {
   try {
-    const job = await keyQueue.add(
-      'reserve-key',
-      {},
-      {
-        removeOnComplete: true,
-        removeOnFail: false
-      }
-    );
-
-    const key = KEY_QUEUE_REQUEST_TIMEOUT_MS > 0
-      ? await job.waitUntilFinished(keyQueueEvents, KEY_QUEUE_REQUEST_TIMEOUT_MS)
-      : await job.waitUntilFinished(keyQueueEvents);
-    if (!key) {
-      return res.status(503).json({ status: 'wait', message: 'No keys available' });
+    const keys = await keyManager.getAvailableKeysSnapshot();
+    const now = Date.now();
+    const payload = keys.map((key) => ({
+      ...key,
+      nextRequestInMs: Math.max((key.nextRequestAllowedAt || 0) - now, 0)
+    }));
+    if (!payload.length) {
+      return res.json({ status: 'wait', keys: [] });
     }
-    const nextReadyInMs = Math.max((key.nextRequestAllowedAt || 0) - Date.now(), 0);
-    return res.json({
-      subscriptionId: key.subscriptionId,
-      plan: key.plan,
-      avgRequestIntervalMs: key.avgRequestIntervalMs,
-      lastUsed: key.lastUsed,
-      nextRequestAllowedAt: key.nextRequestAllowedAt,
-      nextRequestInMs: nextReadyInMs
-    });
+    return res.json({ status: 'ok', keys: payload });
   } catch (err) {
-    if (err && err.message) {
-      if (err.message.includes('timed out')) {
-        return res.status(429).json({ status: 'wait', retryIn: 3000, message: 'Queue busy' });
-      }
-      if (err.message === 'QUEUE_TIMEOUT') {
-        return res.status(429).json({ status: 'wait', retryIn: 3000, message: 'All keys busy' });
-      }
-    }
     logger.error({ msg: 'Error in /key/available', error: err?.message || err });
     return res.status(500).json({ error: 'Internal server error' });
   }
